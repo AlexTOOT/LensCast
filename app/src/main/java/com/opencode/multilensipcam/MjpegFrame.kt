@@ -13,6 +13,8 @@ data class MjpegFrame(
     val encodeDurationMs: Long,
     val yuvToNv21DurationMs: Long,
     val jpegCompressDurationMs: Long,
+    val outputTransformDurationMs: Long,
+    val overlayRenderDurationMs: Long,
     val sourceFramesSeen: Long,
     val sourceFramesEncoded: Long,
     val sourceFramesDropped: Long,
@@ -37,6 +39,8 @@ data class MjpegFrame(
         if (encodeDurationMs != other.encodeDurationMs) return false
         if (yuvToNv21DurationMs != other.yuvToNv21DurationMs) return false
         if (jpegCompressDurationMs != other.jpegCompressDurationMs) return false
+        if (outputTransformDurationMs != other.outputTransformDurationMs) return false
+        if (overlayRenderDurationMs != other.overlayRenderDurationMs) return false
         if (sourceFramesSeen != other.sourceFramesSeen) return false
         if (sourceFramesEncoded != other.sourceFramesEncoded) return false
         if (sourceFramesDropped != other.sourceFramesDropped) return false
@@ -57,6 +61,8 @@ data class MjpegFrame(
         result = 31 * result + encodeDurationMs.hashCode()
         result = 31 * result + yuvToNv21DurationMs.hashCode()
         result = 31 * result + jpegCompressDurationMs.hashCode()
+        result = 31 * result + outputTransformDurationMs.hashCode()
+        result = 31 * result + overlayRenderDurationMs.hashCode()
         result = 31 * result + sourceFramesSeen.hashCode()
         result = 31 * result + sourceFramesEncoded.hashCode()
         result = 31 * result + sourceFramesDropped.hashCode()

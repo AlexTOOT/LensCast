@@ -1970,4 +1970,168 @@ object WebDashboardPage {
             </html>
         """.trimIndent()
     }
+
+    fun renderShell(versionLabel: String): String {
+        val currentAssets = assets(versionLabel)
+        return """
+            <!doctype html>
+            <html lang="zh-CN">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>LensCast</title>
+            </head>
+            <body>
+              <div id="app">Loading…</div>
+              <script>
+                (async function () {
+                  const versionLabel = ${quoteJs(versionLabel)};
+                  const bodyChunkCount = ${currentAssets.bodyChunks.size};
+                  const cssChunkCount = ${currentAssets.cssChunks.size};
+                  const jsChunkCount = ${currentAssets.jsChunks.size};
+                  const retryTimeoutsMs = [1500, 3000, 6000];
+                  const app = document.getElementById('app');
+
+                  const fetchChunkWithRetry = async (basePath, index) => {
+                    let lastError = null;
+                    for (let attempt = 0; attempt < retryTimeoutsMs.length; attempt++) {
+                      const timeoutMs = retryTimeoutsMs[attempt];
+                      const supportsAbortController = typeof AbortController === 'function';
+                      const controller = supportsAbortController ? new AbortController() : null;
+                      const timer = supportsAbortController ? setTimeout(() => controller.abort(), timeoutMs) : null;
+                      try {
+                        const cacheBust = 'v=' + encodeURIComponent(versionLabel) + '&i=' + index + '&a=' + attempt + '&t=' + Date.now();
+                        const requestPath = basePath + '/' + index + '?' + cacheBust;
+                        const response = supportsAbortController
+                          ? await fetch(requestPath, { cache: 'no-store', signal: controller.signal })
+                          : await fetch(requestPath, { cache: 'no-store' });
+                        if (!response.ok) {
+                          throw new Error('HTTP ' + response.status + ' ' + basePath + '/' + index);
+                        }
+                        return await response.text();
+                      } catch (error) {
+                        lastError = error;
+                      } finally {
+                        if (timer != null) clearTimeout(timer);
+                      }
+                    }
+                    throw lastError || new Error('Failed to load ' + basePath + '/' + index);
+                  };
+
+                  const loadChunks = async (basePath, count) => {
+                    if (count <= 0) throw new Error('No chunks for ' + basePath);
+                    const requests = Array.from({ length: count }, (_, index) => fetchChunkWithRetry(basePath, index));
+                    const parts = await Promise.all(requests);
+                    return parts.join('');
+                  };
+
+                  try {
+                    const body = await loadChunks('/assets/dashboard.body', bodyChunkCount);
+                    app.innerHTML = body;
+                    const cssText = await loadChunks('/assets/dashboard.css', cssChunkCount);
+                    const style = document.createElement('style');
+                    style.textContent = cssText;
+                    document.head.appendChild(style);
+                    const scriptText = await loadChunks('/assets/dashboard.js', jsChunkCount);
+                    (0, eval)(scriptText);
+                  } catch (error) {
+                    app.textContent = 'Web UI load failed: ' + (error && error.message ? error.message : String(error));
+                  }
+                })();
+              </script>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    fun bodyChunk(index: Int, versionLabel: String): String? {
+        return assets(versionLabel).bodyChunks.getOrNull(index)
+    }
+
+    fun cssChunk(index: Int, versionLabel: String): String? {
+        return assets(versionLabel).cssChunks.getOrNull(index)
+    }
+
+    fun jsChunk(index: Int, versionLabel: String): String? {
+        return assets(versionLabel).jsChunks.getOrNull(index)
+    }
+
+    private data class DashboardAssets(
+        val bodyChunks: List<String>,
+        val cssChunks: List<String>,
+        val jsChunks: List<String>
+    )
+
+    @Volatile
+    private var cachedVersionLabel: String? = null
+
+    @Volatile
+    private var cachedAssets: DashboardAssets? = null
+
+    private fun assets(versionLabel: String): DashboardAssets {
+        val cached = cachedAssets
+        if (cached != null && cachedVersionLabel == versionLabel) return cached
+        return synchronized(this) {
+            val insideLockCached = cachedAssets
+            if (insideLockCached != null && cachedVersionLabel == versionLabel) {
+                insideLockCached
+            } else {
+                val rebuilt = extractAssets(versionLabel)
+                cachedVersionLabel = versionLabel
+                cachedAssets = rebuilt
+                rebuilt
+            }
+        }
+    }
+
+    private fun extractAssets(versionLabel: String): DashboardAssets {
+        val html = render(versionLabel)
+        val style = between(html, "<style>", "</style>").trim()
+        val script = between(html, "<script>", "</script>").trim()
+        val body = between(html, "<body>", "<script>").trim()
+        return DashboardAssets(
+            bodyChunks = splitChunks(body, ASSET_CHUNK_BYTES),
+            cssChunks = splitChunks(style, ASSET_CHUNK_BYTES),
+            jsChunks = splitChunks(script, ASSET_CHUNK_BYTES)
+        )
+    }
+
+    private fun between(source: String, startToken: String, endToken: String): String {
+        val start = source.indexOf(startToken)
+        if (start < 0) return ""
+        val from = start + startToken.length
+        val end = source.indexOf(endToken, from)
+        if (end < 0 || end < from) return ""
+        return source.substring(from, end)
+    }
+
+    private fun splitChunks(text: String, chunkSize: Int): List<String> {
+        if (text.isEmpty()) return emptyList()
+        val chunks = ArrayList<String>((text.length + chunkSize - 1) / chunkSize)
+        var offset = 0
+        while (offset < text.length) {
+            val end = minOf(offset + chunkSize, text.length)
+            chunks += text.substring(offset, end)
+            offset = end
+        }
+        return chunks
+    }
+
+    private fun quoteJs(value: String): String {
+        return buildString(value.length + 2) {
+            append('"')
+            value.forEach { ch ->
+                when (ch) {
+                    '\\' -> append("\\\\")
+                    '"' -> append("\\\"")
+                    '\r' -> append("\\r")
+                    '\n' -> append("\\n")
+                    else -> append(ch)
+                }
+            }
+            append('"')
+        }
+    }
+
+    private const val ASSET_CHUNK_BYTES = 4 * 1024
 }

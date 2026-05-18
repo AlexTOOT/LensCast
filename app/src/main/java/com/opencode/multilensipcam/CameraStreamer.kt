@@ -82,6 +82,7 @@ class CameraStreamer(
     private val streamGeneration = AtomicLong(0L)
     private val overlayTimeFormat = SimpleDateFormat("MM/dd/yy HH:mm:ss", Locale.US)
     private val overlayRenderer = PixelFontOverlayRenderer()
+    private val nv21OverlayRenderer = Nv21PixelOverlayRenderer()
 
     fun start(config: CameraStreamConfig, textureView: SurfaceTexture) {
         stop()
@@ -151,23 +152,29 @@ class CameraStreamer(
                 try {
                     val encodeStartedAtMs = SystemClock.elapsedRealtime()
                     val outputRotationDegrees = normalizeOutputRotationDegrees(mjpegOutputRotationProvider())
+                    val overlayStatus = videoOverlayStatusProvider()
                     val jpeg = when (activeMjpegPipeline) {
                         MjpegPipeline.YUV_JPEG -> yuv420ToJpeg(
                             image = image,
                             jpegQuality = activeConfig.jpegQuality,
-                            outputRotationDegrees = outputRotationDegrees
+                            outputRotationDegrees = outputRotationDegrees,
+                            overlayStatus = overlayStatus
                         )
                         MjpegPipeline.CAMERA_JPEG -> cameraJpegImageToBytes(image)
                     }
-                    val overlayStatus = videoOverlayStatusProvider()
                     val rotationRemainingAfterEncode = normalizeOutputRotationDegrees(
                         outputRotationDegrees - jpeg.rotationAppliedBeforeEncodeDegrees
                     )
-                    val frameBytes = applyOutputTransformIfNeeded(
+                    val overlayPendingStatus = if (jpeg.overlayAppliedBeforeEncode) {
+                        overlayStatus.copy(enabled = false)
+                    } else {
+                        overlayStatus
+                    }
+                    val transformResult = applyOutputTransformIfNeeded(
                         sourceJpeg = jpeg.bytes,
                         rotationDegrees = rotationRemainingAfterEncode,
                         jpegQuality = activeConfig.jpegQuality,
-                        overlayStatus = overlayStatus
+                        overlayStatus = overlayPendingStatus
                     )
                     val frameWidth = if (outputRotationDegrees == 90 || outputRotationDegrees == 270) {
                         image.height
@@ -182,7 +189,7 @@ class CameraStreamer(
                     val generatedAtMs = SystemClock.elapsedRealtime()
                     sourceFramesEncoded += 1
                     val frame = MjpegFrame(
-                        bytes = frameBytes,
+                        bytes = transformResult.bytes,
                         pipeline = activeMjpegPipeline,
                         width = frameWidth,
                         height = frameHeight,
@@ -194,6 +201,8 @@ class CameraStreamer(
                         encodeDurationMs = generatedAtMs - encodeStartedAtMs,
                         yuvToNv21DurationMs = jpeg.yuvToNv21DurationMs,
                         jpegCompressDurationMs = jpeg.jpegCompressDurationMs,
+                        outputTransformDurationMs = transformResult.transformDurationMs,
+                        overlayRenderDurationMs = jpeg.overlayRenderDurationMs + transformResult.overlayRenderDurationMs,
                         sourceFramesSeen = sourceFramesSeen,
                         sourceFramesEncoded = sourceFramesEncoded,
                         sourceFramesDropped = sourceFramesDroppedByFpsGate + sourceFramesDroppedByEncoderBusy,
@@ -978,7 +987,9 @@ class CameraStreamer(
         val bytes: ByteArray,
         val rotationAppliedBeforeEncodeDegrees: Int,
         val yuvToNv21DurationMs: Long,
-        val jpegCompressDurationMs: Long
+        val jpegCompressDurationMs: Long,
+        val overlayAppliedBeforeEncode: Boolean,
+        val overlayRenderDurationMs: Long
     )
 
     private fun cameraJpegImageToBytes(image: Image): JpegEncodeResult {
@@ -988,7 +999,9 @@ class CameraStreamer(
                 bytes = ByteArray(0),
                 rotationAppliedBeforeEncodeDegrees = 0,
                 yuvToNv21DurationMs = 0,
-                jpegCompressDurationMs = 0
+                jpegCompressDurationMs = 0,
+                overlayAppliedBeforeEncode = false,
+                overlayRenderDurationMs = 0
             )
         }
         val bytes = ByteArray(buffer.remaining())
@@ -997,21 +1010,50 @@ class CameraStreamer(
             bytes = bytes,
             rotationAppliedBeforeEncodeDegrees = 0,
             yuvToNv21DurationMs = 0,
-            jpegCompressDurationMs = 0
+            jpegCompressDurationMs = 0,
+            overlayAppliedBeforeEncode = false,
+            overlayRenderDurationMs = 0
         )
     }
 
-    private fun yuv420ToJpeg(image: Image, jpegQuality: Int, outputRotationDegrees: Int): JpegEncodeResult {
+    private fun yuv420ToJpeg(
+        image: Image,
+        jpegQuality: Int,
+        outputRotationDegrees: Int,
+        overlayStatus: VideoOverlayStatus
+    ): JpegEncodeResult {
         val convertStartedAtMs = SystemClock.elapsedRealtime()
         val nv21 = yuv420888ToNv21(image)
-        val rotationAppliedBeforeEncode = if (normalizeOutputRotationDegrees(outputRotationDegrees) == 180) {
+        val normalizedOutputRotation = normalizeOutputRotationDegrees(outputRotationDegrees)
+        val rotationAppliedBeforeEncode = if (normalizedOutputRotation == 180) {
             rotateNv21By180InPlace(nv21, image.width, image.height)
             180
         } else {
             0
         }
         val convertFinishedAtMs = SystemClock.elapsedRealtime()
+        var overlayAppliedBeforeEncode = false
+        var overlayRenderDurationMs = 0L
+        if (overlayStatus.enabled && (normalizedOutputRotation == 0 || normalizedOutputRotation == 180)) {
+            val timestamp = synchronized(overlayTimeFormat) {
+                overlayTimeFormat.format(Date())
+            }
+            val overlayStartedAtMs = SystemClock.elapsedRealtime()
+            runCatching {
+                nv21OverlayRenderer.draw(
+                    nv21 = nv21,
+                    width = image.width,
+                    height = image.height,
+                    timestamp = timestamp,
+                    status = overlayStatus
+                )
+            }.onSuccess {
+                overlayAppliedBeforeEncode = true
+                overlayRenderDurationMs = SystemClock.elapsedRealtime() - overlayStartedAtMs
+            }
+        }
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val compressStartedAtMs = SystemClock.elapsedRealtime()
         val jpeg = ByteArrayOutputStream().use { output ->
             yuvImage.compressToJpeg(
                 Rect(0, 0, image.width, image.height),
@@ -1024,7 +1066,9 @@ class CameraStreamer(
             bytes = jpeg,
             rotationAppliedBeforeEncodeDegrees = rotationAppliedBeforeEncode,
             yuvToNv21DurationMs = convertFinishedAtMs - convertStartedAtMs,
-            jpegCompressDurationMs = SystemClock.elapsedRealtime() - convertFinishedAtMs
+            jpegCompressDurationMs = SystemClock.elapsedRealtime() - compressStartedAtMs,
+            overlayAppliedBeforeEncode = overlayAppliedBeforeEncode,
+            overlayRenderDurationMs = overlayRenderDurationMs
         )
     }
 
@@ -1103,17 +1147,33 @@ class CameraStreamer(
         }
     }
 
+    private data class OutputTransformResult(
+        val bytes: ByteArray,
+        val transformDurationMs: Long,
+        val overlayRenderDurationMs: Long
+    )
+
     private fun applyOutputTransformIfNeeded(
         sourceJpeg: ByteArray,
         rotationDegrees: Int,
         jpegQuality: Int,
         overlayStatus: VideoOverlayStatus
-    ): ByteArray {
-        if (sourceJpeg.isEmpty()) return sourceJpeg
+    ): OutputTransformResult {
+        if (sourceJpeg.isEmpty()) {
+            return OutputTransformResult(sourceJpeg, 0, 0)
+        }
+        val transformStartedAtMs = SystemClock.elapsedRealtime()
         val normalizedRotation = normalizeOutputRotationDegrees(rotationDegrees)
-        if (normalizedRotation == 0 && !overlayStatus.enabled) return sourceJpeg
+        if (normalizedRotation == 0 && !overlayStatus.enabled) {
+            return OutputTransformResult(sourceJpeg, 0, 0)
+        }
         return runCatching {
-            val decoded = BitmapFactory.decodeByteArray(sourceJpeg, 0, sourceJpeg.size) ?: return sourceJpeg
+            val decodeOptions = BitmapFactory.Options().apply {
+                inMutable = overlayStatus.enabled
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val decoded = BitmapFactory.decodeByteArray(sourceJpeg, 0, sourceJpeg.size, decodeOptions)
+                ?: return OutputTransformResult(sourceJpeg, 0, 0)
             val rotatedBitmap = if (normalizedRotation == 0) {
                 decoded
             } else {
@@ -1131,6 +1191,7 @@ class CameraStreamer(
                 decoded.recycle()
             }
 
+            var overlayRenderDurationMs = 0L
             val targetBitmap = if (overlayStatus.enabled) {
                 val mutableBitmap = if (rotatedBitmap.isMutable) {
                     rotatedBitmap
@@ -1141,7 +1202,7 @@ class CameraStreamer(
                         } else {
                             decoded.recycle()
                         }
-                        return sourceJpeg
+                        return OutputTransformResult(sourceJpeg, 0, 0)
                     }
                     if (copy !== rotatedBitmap) {
                         rotatedBitmap.recycle()
@@ -1153,12 +1214,14 @@ class CameraStreamer(
                 val timestamp = synchronized(overlayTimeFormat) {
                     overlayTimeFormat.format(Date())
                 }
+                val overlayStartedAtMs = SystemClock.elapsedRealtime()
                 overlayRenderer.draw(
                     canvas = canvas,
                     background = mutableBitmap,
                     timestamp = timestamp,
                     status = overlayStatus
                 )
+                overlayRenderDurationMs = SystemClock.elapsedRealtime() - overlayStartedAtMs
                 mutableBitmap
             } else {
                 rotatedBitmap
@@ -1173,8 +1236,14 @@ class CameraStreamer(
                 output.toByteArray()
             }
             targetBitmap.recycle()
-            encoded
-        }.getOrElse { sourceJpeg }
+            OutputTransformResult(
+                bytes = encoded,
+                transformDurationMs = SystemClock.elapsedRealtime() - transformStartedAtMs,
+                overlayRenderDurationMs = overlayRenderDurationMs
+            )
+        }.getOrElse {
+            OutputTransformResult(sourceJpeg, 0, 0)
+        }
     }
 
     private fun normalizeOutputRotationDegrees(rotationDegrees: Int): Int {

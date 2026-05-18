@@ -1,26 +1,21 @@
 package com.opencode.multilensipcam
 
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-class PixelFontOverlayRenderer {
-    private val pixelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
+class Nv21PixelOverlayRenderer {
     private var cachedLayout: OverlayLayout? = null
     private var cachedLayoutKey: OverlayLayoutKey? = null
 
     fun draw(
-        canvas: Canvas,
-        background: Bitmap,
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
         timestamp: String,
         status: VideoOverlayStatus
     ) {
+        if (width <= 0 || height <= 0) return
         val batteryPercentText = status.batteryPercent?.coerceIn(0, 100)?.let { "$it%" } ?: "--%"
         val chargingText = if (status.charging) " ~" else ""
         val text = "$timestamp $batteryPercentText$chargingText"
@@ -32,15 +27,14 @@ class PixelFontOverlayRenderer {
         val cellSize = (status.targetWidthPx / totalCells).coerceIn(MIN_CELL_SIZE_PX, MAX_CELL_SIZE_PX)
         val margin = max(8f, cellSize)
         val normalizedCellSize = (cellSize * 10f).roundToInt() / 10f
-        val layoutKey = OverlayLayoutKey(
+        val key = OverlayLayoutKey(
             timestamp = timestamp,
             batteryPercent = status.batteryPercent?.coerceIn(0, 100),
             charging = status.charging,
             cellSizePx = normalizedCellSize
         )
-
-        val layout = getOrBuildLayout(layoutKey, timestamp, batteryPercentText, chargingText, cellSize)
-        drawLayout(canvas, background, margin, margin, layout)
+        val layout = getOrBuildLayout(key, timestamp, batteryPercentText, chargingText, cellSize)
+        drawLayout(nv21, width, height, margin.roundToInt(), margin.roundToInt(), layout)
     }
 
     private fun getOrBuildLayout(
@@ -56,36 +50,28 @@ class PixelFontOverlayRenderer {
         }
 
         var x = 0f
-        val glyphEntries = ArrayList<GlyphLayoutEntry>(timestamp.length + batteryPercentText.length + chargingText.length + 8)
-
+        val glyphs = ArrayList<GlyphLayoutEntry>(timestamp.length + batteryPercentText.length + chargingText.length + 8)
         for (char in timestamp) {
-            val advance = appendGlyphLayoutEntry(glyphEntries, char, x, cellSize)
-            x += advance
+            x += appendGlyphLayoutEntry(glyphs, char, x, cellSize)
         }
         x += GLYPH_ADVANCE_CELLS * cellSize
         val batteryPercent = key.batteryPercent
-        val batteryEntry = BatteryLayoutEntry(
-            left = x,
-            top = 0f,
-            width = BATTERY_WIDTH_CELLS * cellSize,
-            height = GLYPH_HEIGHT * cellSize,
-            cellSize = cellSize,
+        val battery = BatteryLayoutEntry(
+            left = x.roundToInt(),
+            top = 0,
+            width = (BATTERY_WIDTH_CELLS * cellSize).roundToInt().coerceAtLeast(1),
+            height = (GLYPH_HEIGHT * cellSize).roundToInt().coerceAtLeast(1),
+            cellSizePx = cellSize.roundToInt().coerceAtLeast(1),
             fillBars = when {
                 batteryPercent == null || batteryPercent <= 0 -> 0
                 else -> ceil(batteryPercent / 25f).toInt().coerceIn(1, 4)
             }
         )
         x += BATTERY_ADVANCE_CELLS * cellSize
-
         for (char in " $batteryPercentText$chargingText") {
-            val advance = appendGlyphLayoutEntry(glyphEntries, char, x, cellSize)
-            x += advance
+            x += appendGlyphLayoutEntry(glyphs, char, x, cellSize)
         }
-
-        return OverlayLayout(
-            glyphs = glyphEntries,
-            battery = batteryEntry
-        ).also {
+        return OverlayLayout(glyphs = glyphs, battery = battery).also {
             cachedLayout = it
             cachedLayoutKey = key
         }
@@ -98,171 +84,222 @@ class PixelFontOverlayRenderer {
         cellSize: Float
     ): Float {
         val char = if (rawChar in 'a'..'z') rawChar.uppercaseChar() else rawChar
-        if (char == ' ') {
-            return GLYPH_ADVANCE_CELLS * cellSize
-        }
+        if (char == ' ') return GLYPH_ADVANCE_CELLS * cellSize
         val glyph = GLYPHS[char] ?: GLYPHS['?'] ?: EMPTY_GLYPH
         entries.add(
             GlyphLayoutEntry(
                 glyph = glyph,
-                left = left,
-                top = 0f,
-                width = GLYPH_WIDTH * cellSize,
-                height = GLYPH_HEIGHT * cellSize,
-                cellSize = cellSize
+                left = left.roundToInt(),
+                top = 0,
+                width = (GLYPH_WIDTH * cellSize).roundToInt().coerceAtLeast(1),
+                height = (GLYPH_HEIGHT * cellSize).roundToInt().coerceAtLeast(1),
+                cellSizePx = cellSize.roundToInt().coerceAtLeast(1)
             )
         )
         return GLYPH_ADVANCE_CELLS * cellSize
     }
 
     private fun drawLayout(
-        canvas: Canvas,
-        background: Bitmap,
-        originX: Float,
-        originY: Float,
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        originX: Int,
+        originY: Int,
         layout: OverlayLayout
     ) {
-        for (entry in layout.glyphs) {
-            val drawX = originX + entry.left
-            val drawY = originY + entry.top
-            val color = pickForegroundColor(background, drawX, drawY, entry.width, entry.height)
-            drawGlyph(canvas, entry.glyph, drawX, drawY, entry.cellSize, color)
+        for (glyph in layout.glyphs) {
+            val drawX = originX + glyph.left
+            val drawY = originY + glyph.top
+            val brightBackground = isBrightRegion(nv21, width, height, drawX, drawY, glyph.width, glyph.height)
+            drawGlyphNv21(nv21, width, height, glyph, drawX, drawY, brightBackground)
         }
         val battery = layout.battery
         val batteryX = originX + battery.left
         val batteryY = originY + battery.top
-        val batteryColor = pickForegroundColor(background, batteryX, batteryY, battery.width, battery.height)
-        drawBatteryIcon(canvas, batteryX, batteryY, battery.cellSize, batteryColor, battery.fillBars)
+        val brightBackground = isBrightRegion(nv21, width, height, batteryX, batteryY, battery.width, battery.height)
+        drawBatteryNv21(nv21, width, height, battery, batteryX, batteryY, brightBackground)
     }
 
-    private fun drawBatteryIcon(
-        canvas: Canvas,
-        x: Float,
-        y: Float,
-        cellSize: Float,
-        color: Int,
-        fillBars: Int
+    private fun drawGlyphNv21(
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        glyph: GlyphLayoutEntry,
+        x: Int,
+        y: Int,
+        brightBackground: Boolean
     ) {
-        val shadowColor = if (color == Color.WHITE) Color.argb(110, 0, 0, 0) else Color.argb(110, 255, 255, 255)
-        val shadowOffset = max(1f, cellSize * 0.33f)
-
-        drawBatteryBody(canvas, x + shadowOffset, y + shadowOffset, cellSize, shadowColor, fillBars)
-        drawBatteryBody(canvas, x, y, cellSize, color, fillBars)
+        val fg = if (brightBackground) LUMA_BLACK else LUMA_WHITE
+        val shadow = if (brightBackground) LUMA_WHITE_SHADOW else LUMA_BLACK_SHADOW
+        val shadowOffset = max(1, (glyph.cellSizePx * 33) / 100)
+        drawGlyphPixels(nv21, width, height, glyph.glyph, x + shadowOffset, y + shadowOffset, glyph.cellSizePx, shadow)
+        drawGlyphPixels(nv21, width, height, glyph.glyph, x, y, glyph.cellSizePx, fg)
     }
 
-    private fun drawBatteryBody(
-        canvas: Canvas,
-        x: Float,
-        y: Float,
-        cellSize: Float,
-        color: Int,
-        fillBars: Int
+    private fun drawBatteryNv21(
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        battery: BatteryLayoutEntry,
+        x: Int,
+        y: Int,
+        brightBackground: Boolean
     ) {
-        pixelPaint.color = color
-        drawCellRect(canvas, x, y, BATTERY_BODY_WIDTH_CELLS, 1, cellSize)
-        drawCellRect(canvas, x, y + (GLYPH_HEIGHT - 1) * cellSize, BATTERY_BODY_WIDTH_CELLS, 1, cellSize)
-        drawCellRect(canvas, x, y, 1, GLYPH_HEIGHT, cellSize)
-        drawCellRect(canvas, x + (BATTERY_BODY_WIDTH_CELLS - 1) * cellSize, y, 1, GLYPH_HEIGHT, cellSize)
-
-        val terminalX = x + BATTERY_BODY_WIDTH_CELLS * cellSize
-        drawCellRect(canvas, terminalX, y + 2f * cellSize, BATTERY_TERMINAL_WIDTH_CELLS, 3, cellSize)
-
-        val innerStartX = x + cellSize
-        val innerY = y + cellSize
-        val barGap = 1
-        for (bar in 0 until fillBars) {
-            val barX = innerStartX + bar * (1 + barGap) * cellSize
-            drawCellRect(canvas, barX, innerY, 1, GLYPH_HEIGHT - 2, cellSize)
-        }
-    }
-
-    private fun drawGlyph(
-        canvas: Canvas,
-        glyph: IntArray,
-        x: Float,
-        y: Float,
-        cellSize: Float,
-        color: Int
-    ) {
-        val shadowColor = if (color == Color.WHITE) Color.argb(110, 0, 0, 0) else Color.argb(110, 255, 255, 255)
-        val shadowOffset = max(1f, cellSize * 0.33f)
-        drawGlyphPixels(canvas, glyph, x + shadowOffset, y + shadowOffset, cellSize, shadowColor)
-        drawGlyphPixels(canvas, glyph, x, y, cellSize, color)
+        val fg = if (brightBackground) LUMA_BLACK else LUMA_WHITE
+        val shadow = if (brightBackground) LUMA_WHITE_SHADOW else LUMA_BLACK_SHADOW
+        val shadowOffset = max(1, (battery.cellSizePx * 33) / 100)
+        drawBatteryBody(nv21, width, height, x + shadowOffset, y + shadowOffset, battery.cellSizePx, shadow, battery.fillBars)
+        drawBatteryBody(nv21, width, height, x, y, battery.cellSizePx, fg, battery.fillBars)
     }
 
     private fun drawGlyphPixels(
-        canvas: Canvas,
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
         glyph: IntArray,
-        x: Float,
-        y: Float,
-        cellSize: Float,
-        color: Int
+        x: Int,
+        y: Int,
+        cellSize: Int,
+        luma: Int
     ) {
-        pixelPaint.color = color
         glyph.forEachIndexed { rowIndex, rowBits ->
             for (col in 0 until GLYPH_WIDTH) {
                 val bit = (rowBits shr (GLYPH_WIDTH - 1 - col)) and 0x1
                 if (bit == 0) continue
-                val left = x + (col * cellSize)
-                val top = y + (rowIndex * cellSize)
-                canvas.drawRect(left, top, left + cellSize, top + cellSize, pixelPaint)
+                drawCellRect(nv21, width, height, x + col * cellSize, y + rowIndex * cellSize, cellSize, cellSize, luma)
             }
+        }
+    }
+
+    private fun drawBatteryBody(
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        x: Int,
+        y: Int,
+        cellSize: Int,
+        luma: Int,
+        fillBars: Int
+    ) {
+        drawCellRect(nv21, width, height, x, y, BATTERY_BODY_WIDTH_CELLS * cellSize, cellSize, luma)
+        drawCellRect(
+            nv21,
+            width,
+            height,
+            x,
+            y + (GLYPH_HEIGHT - 1) * cellSize,
+            BATTERY_BODY_WIDTH_CELLS * cellSize,
+            cellSize,
+            luma
+        )
+        drawCellRect(nv21, width, height, x, y, cellSize, GLYPH_HEIGHT * cellSize, luma)
+        drawCellRect(
+            nv21,
+            width,
+            height,
+            x + (BATTERY_BODY_WIDTH_CELLS - 1) * cellSize,
+            y,
+            cellSize,
+            GLYPH_HEIGHT * cellSize,
+            luma
+        )
+        val terminalX = x + BATTERY_BODY_WIDTH_CELLS * cellSize
+        drawCellRect(nv21, width, height, terminalX, y + 2 * cellSize, BATTERY_TERMINAL_WIDTH_CELLS * cellSize, 3 * cellSize, luma)
+        val innerStartX = x + cellSize
+        val innerY = y + cellSize
+        val barGapCells = 1
+        for (bar in 0 until fillBars) {
+            val barX = innerStartX + bar * (1 + barGapCells) * cellSize
+            drawCellRect(nv21, width, height, barX, innerY, cellSize, (GLYPH_HEIGHT - 2) * cellSize, luma)
         }
     }
 
     private fun drawCellRect(
-        canvas: Canvas,
-        x: Float,
-        y: Float,
-        widthCells: Int,
-        heightCells: Int,
-        cellSize: Float
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        left: Int,
+        top: Int,
+        rectWidth: Int,
+        rectHeight: Int,
+        luma: Int
     ) {
-        canvas.drawRect(
-            x,
-            y,
-            x + widthCells * cellSize,
-            y + heightCells * cellSize,
-            pixelPaint
-        )
+        val l = left.coerceIn(0, width)
+        val t = top.coerceIn(0, height)
+        val r = (left + rectWidth).coerceIn(l, width)
+        val b = (top + rectHeight).coerceIn(t, height)
+        if (r <= l || b <= t) return
+
+        for (row in t until b) {
+            var yIndex = row * width + l
+            for (col in l until r) {
+                nv21[yIndex] = luma.toByte()
+                yIndex += 1
+            }
+        }
+        setUvNeutral(nv21, width, height, l, t, r, b)
     }
 
-    private fun pickForegroundColor(
-        bitmap: Bitmap,
-        left: Float,
-        top: Float,
-        width: Float,
-        height: Float
-    ): Int {
-        val bitmapWidth = bitmap.width
-        val bitmapHeight = bitmap.height
-        if (bitmapWidth <= 0 || bitmapHeight <= 0) return Color.WHITE
-
-        val l = left.roundToInt().coerceIn(0, bitmapWidth - 1)
-        val t = top.roundToInt().coerceIn(0, bitmapHeight - 1)
-        val r = (left + width).roundToInt().coerceIn(l + 1, bitmapWidth)
-        val b = (top + height).roundToInt().coerceIn(t + 1, bitmapHeight)
-        val sampleStepX = max(1, (r - l) / 4)
-        val sampleStepY = max(1, (b - t) / 4)
-
-        var luminanceSum = 0.0
-        var samples = 0
-        var yCursor = t
-        while (yCursor < b) {
-            var xCursor = l
-            while (xCursor < r) {
-                val color = bitmap.getPixel(xCursor, yCursor)
-                val rValue = Color.red(color)
-                val gValue = Color.green(color)
-                val bValue = Color.blue(color)
-                luminanceSum += (0.299 * rValue) + (0.587 * gValue) + (0.114 * bValue)
-                samples += 1
-                xCursor += sampleStepX
+    private fun setUvNeutral(
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ) {
+        val ySize = width * height
+        val uvTop = (top / 2) * 2
+        val uvBottom = ((bottom + 1) / 2) * 2
+        val uvLeft = (left / 2) * 2
+        val uvRight = ((right + 1) / 2) * 2
+        var row = uvTop
+        while (row < uvBottom && row < height) {
+            val uvRowStart = ySize + (row / 2) * width
+            var col = uvLeft
+            while (col < uvRight && col + 1 < width) {
+                val uvIndex = uvRowStart + col
+                if (uvIndex + 1 < nv21.size) {
+                    nv21[uvIndex] = 128.toByte()
+                    nv21[uvIndex + 1] = 128.toByte()
+                }
+                col += 2
             }
-            yCursor += sampleStepY
+            row += 2
         }
-        val avgLuminance = if (samples == 0) 0.0 else luminanceSum / samples
-        return if (avgLuminance >= LUMA_BRIGHT_THRESHOLD) Color.BLACK else Color.WHITE
+    }
+
+    private fun isBrightRegion(
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        left: Int,
+        top: Int,
+        regionWidth: Int,
+        regionHeight: Int
+    ): Boolean {
+        val l = left.coerceIn(0, width - 1)
+        val t = top.coerceIn(0, height - 1)
+        val r = (left + regionWidth).coerceIn(l + 1, width)
+        val b = (top + regionHeight).coerceIn(t + 1, height)
+        val stepX = max(1, (r - l) / 4)
+        val stepY = max(1, (b - t) / 4)
+        var sum = 0
+        var count = 0
+        var y = t
+        while (y < b) {
+            var x = l
+            val rowBase = y * width
+            while (x < r) {
+                sum += nv21[rowBase + x].toInt() and 0xFF
+                count += 1
+                x += stepX
+            }
+            y += stepY
+        }
+        if (count == 0) return false
+        return (sum.toDouble() / count.toDouble()) >= LUMA_BRIGHT_THRESHOLD
     }
 
     private companion object {
@@ -276,6 +313,10 @@ class PixelFontOverlayRenderer {
         private const val MIN_CELL_SIZE_PX = 2f
         private const val MAX_CELL_SIZE_PX = 45f
         private const val LUMA_BRIGHT_THRESHOLD = 160.0
+        private const val LUMA_WHITE = 240
+        private const val LUMA_BLACK = 20
+        private const val LUMA_WHITE_SHADOW = 170
+        private const val LUMA_BLACK_SHADOW = 90
         private val EMPTY_GLYPH = intArrayOf(0, 0, 0, 0, 0, 0, 0)
         private val GLYPHS: Map<Char, IntArray> = mapOf(
             '0' to rows("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
@@ -346,9 +387,7 @@ class PixelFontOverlayRenderer {
             var bits = 0
             for (char in row) {
                 bits = bits shl 1
-                if (char == '1') {
-                    bits = bits or 1
-                }
+                if (char == '1') bits = bits or 1
             }
             return bits
         }
@@ -363,19 +402,19 @@ class PixelFontOverlayRenderer {
 
     private data class GlyphLayoutEntry(
         val glyph: IntArray,
-        val left: Float,
-        val top: Float,
-        val width: Float,
-        val height: Float,
-        val cellSize: Float
+        val left: Int,
+        val top: Int,
+        val width: Int,
+        val height: Int,
+        val cellSizePx: Int
     )
 
     private data class BatteryLayoutEntry(
-        val left: Float,
-        val top: Float,
-        val width: Float,
-        val height: Float,
-        val cellSize: Float,
+        val left: Int,
+        val top: Int,
+        val width: Int,
+        val height: Int,
+        val cellSizePx: Int,
         val fillBars: Int
     )
 

@@ -69,6 +69,8 @@ object WebDebugStreamJson {
                 put("latestJpegEncodeMs", latestMjpeg?.encodeDurationMs)
                 put("latestYuvToNv21Ms", latestMjpeg?.yuvToNv21DurationMs)
                 put("latestJpegCompressMs", latestMjpeg?.jpegCompressDurationMs)
+                put("latestOutputTransformMs", latestMjpeg?.outputTransformDurationMs)
+                put("latestOverlayRenderMs", latestMjpeg?.overlayRenderDurationMs)
                 put("framesReceived", snapshot.mjpegFramesReceived)
                 put("framesSent", snapshot.mjpegFramesSent)
                 put("bytesSent", snapshot.mjpegBytesSent)
