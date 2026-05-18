@@ -148,80 +148,92 @@ class CameraStreamer(
                     return@setOnImageAvailableListener
                 }
                 nextFrameDeadlineMs = nowMs + frameIntervalMs
-
-                try {
-                    val encodeStartedAtMs = SystemClock.elapsedRealtime()
-                    val outputRotationDegrees = normalizeOutputRotationDegrees(mjpegOutputRotationProvider())
-                    val overlayStatus = videoOverlayStatusProvider()
-                    val jpeg = when (activeMjpegPipeline) {
-                        MjpegPipeline.YUV_JPEG -> yuv420ToJpeg(
-                            image = image,
-                            jpegQuality = activeConfig.jpegQuality,
-                            outputRotationDegrees = outputRotationDegrees,
-                            overlayStatus = overlayStatus
-                        )
-                        MjpegPipeline.CAMERA_JPEG -> cameraJpegImageToBytes(image)
-                    }
-                    val rotationRemainingAfterEncode = normalizeOutputRotationDegrees(
-                        outputRotationDegrees - jpeg.rotationAppliedBeforeEncodeDegrees
-                    )
-                    val overlayPendingStatus = if (jpeg.overlayAppliedBeforeEncode) {
-                        overlayStatus.copy(enabled = false)
-                    } else {
-                        overlayStatus
-                    }
-                    val transformResult = applyOutputTransformIfNeeded(
-                        sourceJpeg = jpeg.bytes,
-                        rotationDegrees = rotationRemainingAfterEncode,
-                        jpegQuality = activeConfig.jpegQuality,
-                        overlayStatus = overlayPendingStatus
-                    )
-                    val frameWidth = if (outputRotationDegrees == 90 || outputRotationDegrees == 270) {
-                        image.height
-                    } else {
-                        image.width
-                    }
-                    val frameHeight = if (outputRotationDegrees == 90 || outputRotationDegrees == 270) {
-                        image.width
-                    } else {
-                        image.height
-                    }
-                    val generatedAtMs = SystemClock.elapsedRealtime()
-                    sourceFramesEncoded += 1
-                    val frame = MjpegFrame(
-                        bytes = transformResult.bytes,
-                        pipeline = activeMjpegPipeline,
-                        width = frameWidth,
-                        height = frameHeight,
-                        outputRotationDegrees = outputRotationDegrees,
-                        jpegQuality = activeConfig.jpegQuality.coerceIn(25, 92),
-                        targetFps = activeConfig.targetFps,
-                        capturedAtElapsedMs = nowMs,
-                        generatedAtElapsedMs = generatedAtMs,
-                        encodeDurationMs = generatedAtMs - encodeStartedAtMs,
-                        yuvToNv21DurationMs = jpeg.yuvToNv21DurationMs,
-                        jpegCompressDurationMs = jpeg.jpegCompressDurationMs,
-                        outputTransformDurationMs = transformResult.transformDurationMs,
-                        overlayRenderDurationMs = jpeg.overlayRenderDurationMs + transformResult.overlayRenderDurationMs,
-                        sourceFramesSeen = sourceFramesSeen,
-                        sourceFramesEncoded = sourceFramesEncoded,
-                        sourceFramesDropped = sourceFramesDroppedByFpsGate + sourceFramesDroppedByEncoderBusy,
-                        sourceFramesDroppedByFpsGate = sourceFramesDroppedByFpsGate,
-                        sourceFramesDroppedByEncoderBusy = sourceFramesDroppedByEncoderBusy
-                    )
-                    encodeExecutor?.execute {
-                        try {
-                            onFrame(frame)
-                        } catch (_: Exception) {
-                            // Keep streaming alive if a consumer fails.
-                        } finally {
-                            encodeInFlight.set(false)
-                        }
-                    } ?: encodeInFlight.set(false)
+                val pipeline = activeMjpegPipeline
+                val copiedFrame = try {
+                    copyCapturedFrame(image, pipeline)
                 } catch (_: Exception) {
                     encodeInFlight.set(false)
-                } finally {
                     image.close()
+                    return@setOnImageAvailableListener
+                }
+                image.close()
+
+                val executor = encodeExecutor
+                if (executor == null) {
+                    encodeInFlight.set(false)
+                    return@setOnImageAvailableListener
+                }
+                executor.execute {
+                    try {
+                        val encodeStartedAtMs = SystemClock.elapsedRealtime()
+                        val outputRotationDegrees = normalizeOutputRotationDegrees(mjpegOutputRotationProvider())
+                        val overlayStatus = videoOverlayStatusProvider()
+                        val jpeg = when (copiedFrame) {
+                            is CopiedFrame.Yuv -> yuv420ToJpegFromNv21(
+                                nv21 = copiedFrame.nv21,
+                                width = copiedFrame.width,
+                                height = copiedFrame.height,
+                                yuvToNv21DurationMs = copiedFrame.yuvToNv21DurationMs,
+                                jpegQuality = activeConfig.jpegQuality,
+                                outputRotationDegrees = outputRotationDegrees,
+                                overlayStatus = overlayStatus
+                            )
+
+                            is CopiedFrame.CameraJpeg -> cameraJpegBytesToResult(copiedFrame.bytes)
+                        }
+                        val rotationRemainingAfterEncode = normalizeOutputRotationDegrees(
+                            outputRotationDegrees - jpeg.rotationAppliedBeforeEncodeDegrees
+                        )
+                        val overlayPendingStatus = if (jpeg.overlayAppliedBeforeEncode) {
+                            overlayStatus.copy(enabled = false)
+                        } else {
+                            overlayStatus
+                        }
+                        val transformResult = applyOutputTransformIfNeeded(
+                            sourceJpeg = jpeg.bytes,
+                            rotationDegrees = rotationRemainingAfterEncode,
+                            jpegQuality = activeConfig.jpegQuality,
+                            overlayStatus = overlayPendingStatus
+                        )
+                        val frameWidth = if (outputRotationDegrees == 90 || outputRotationDegrees == 270) {
+                            copiedFrame.height
+                        } else {
+                            copiedFrame.width
+                        }
+                        val frameHeight = if (outputRotationDegrees == 90 || outputRotationDegrees == 270) {
+                            copiedFrame.width
+                        } else {
+                            copiedFrame.height
+                        }
+                        val generatedAtMs = SystemClock.elapsedRealtime()
+                        sourceFramesEncoded += 1
+                        val frame = MjpegFrame(
+                            bytes = transformResult.bytes,
+                            pipeline = pipeline,
+                            width = frameWidth,
+                            height = frameHeight,
+                            outputRotationDegrees = outputRotationDegrees,
+                            jpegQuality = activeConfig.jpegQuality.coerceIn(25, 92),
+                            targetFps = activeConfig.targetFps,
+                            capturedAtElapsedMs = nowMs,
+                            generatedAtElapsedMs = generatedAtMs,
+                            encodeDurationMs = generatedAtMs - encodeStartedAtMs,
+                            yuvToNv21DurationMs = jpeg.yuvToNv21DurationMs,
+                            jpegCompressDurationMs = jpeg.jpegCompressDurationMs,
+                            outputTransformDurationMs = transformResult.transformDurationMs,
+                            overlayRenderDurationMs = jpeg.overlayRenderDurationMs + transformResult.overlayRenderDurationMs,
+                            sourceFramesSeen = sourceFramesSeen,
+                            sourceFramesEncoded = sourceFramesEncoded,
+                            sourceFramesDropped = sourceFramesDroppedByFpsGate + sourceFramesDroppedByEncoderBusy,
+                            sourceFramesDroppedByFpsGate = sourceFramesDroppedByFpsGate,
+                            sourceFramesDroppedByEncoderBusy = sourceFramesDroppedByEncoderBusy
+                        )
+                        onFrame(frame)
+                    } catch (_: Exception) {
+                        // Keep streaming alive if encode or consumer fails.
+                    } finally {
+                        encodeInFlight.set(false)
+                    }
                 }
             }, backgroundHandler)
         }
@@ -297,23 +309,24 @@ class CameraStreamer(
         config: CameraStreamConfig,
         characteristics: CameraCharacteristics?
     ): MjpegPipeline {
-        if (config.mjpegPipeline != MjpegPipeline.CAMERA_JPEG) {
-            return MjpegPipeline.YUV_JPEG
-        }
         val jpegSizes = characteristics
             ?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(ImageFormat.JPEG)
             ?.toList()
             .orEmpty()
-        val supported = jpegSizes.any { size ->
+        val cameraJpegSupported = jpegSizes.any { size ->
             size.width == config.mjpegSize.width && size.height == config.mjpegSize.height
         }
-        return if (supported) {
-            MjpegPipeline.CAMERA_JPEG
-        } else {
-            onStatus("Camera JPEG output unsupported at ${config.mjpegSize.width}x${config.mjpegSize.height}; using YUV")
-            MjpegPipeline.YUV_JPEG
+        if (config.mjpegPipeline == MjpegPipeline.CAMERA_JPEG) {
+            return if (cameraJpegSupported) {
+                MjpegPipeline.CAMERA_JPEG
+            } else {
+                onStatus("Camera JPEG output unsupported at ${config.mjpegSize.width}x${config.mjpegSize.height}; using YUV")
+                MjpegPipeline.YUV_JPEG
+            }
         }
+
+        return MjpegPipeline.YUV_JPEG
     }
 
     fun updateRuntimeControls(
@@ -334,6 +347,10 @@ class CameraStreamer(
             torchEnabled = torchEnabled
         )
         currentConfig?.let(::updateVideoEncoderBitrate)
+        backgroundHandler?.post { rebuildRepeatingRequest() }
+    }
+
+    fun onMjpegDemandStateChanged() {
         backgroundHandler?.post { rebuildRepeatingRequest() }
     }
 
@@ -577,20 +594,9 @@ class CameraStreamer(
         encoderSurface: Surface?,
         generation: Long
     ) {
-        currentRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(previewSurface)
-            addTarget(readerSurface)
-            if (encoderSurface != null) {
-                addTarget(encoderSurface)
-            }
-            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        }
         currentSessionMode = if (encoderSurface != null) "regular-video" else "regular-mjpeg"
         currentSessionModeReason = currentConfig?.highSpeedVideoFallbackReason ?: streamDebugState.sessionModeReason
         currentRequestTemplate = "TEMPLATE_PREVIEW"
-        currentTargetSurfaces = listOfNotNull("preview", "mjpegImageReader", encoderSurface?.let { "h264Encoder" })
         highSpeedSessionActive = false
 
         rebuildRepeatingRequest(camera, generation)
@@ -630,10 +636,35 @@ class CameraStreamer(
         capturedCamera: CameraDevice? = cameraDevice,
         capturedGeneration: Long = streamGeneration.get()
     ): Boolean {
-        val builder = currentRequestBuilder ?: return false
         val session = captureSession ?: return false
         val config = currentConfig ?: return false
-        applyControls(builder, config, currentCharacteristics)
+        if (!highSpeedSessionActive) {
+            val previewSurface = activePreviewSurface ?: return false
+            val readerSurface = activeReaderSurface
+            val encoderSurface = activeEncoderSurface
+            val includeReaderSurface = readerSurface != null && mjpegConsumerActive()
+            currentRequestBuilder = cameraDeviceForRequest(capturedCamera)?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)?.apply {
+                addTarget(previewSurface)
+                if (includeReaderSurface) {
+                    val activeReaderSurface = readerSurface ?: return false
+                    addTarget(activeReaderSurface)
+                }
+                if (encoderSurface != null) {
+                    addTarget(encoderSurface)
+                }
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            } ?: return false
+            currentRequestTemplate = "TEMPLATE_PREVIEW"
+            currentTargetSurfaces = listOfNotNull(
+                "preview",
+                if (includeReaderSurface) "mjpegImageReader" else null,
+                encoderSurface?.let { "h264Encoder" }
+            )
+        }
+        val activeBuilder = currentRequestBuilder ?: return false
+        applyControls(activeBuilder, config, currentCharacteristics)
 
         val highSpeedSession = if (highSpeedSessionActive) {
             session as? CameraConstrainedHighSpeedCaptureSession
@@ -643,7 +674,7 @@ class CameraStreamer(
 
         if (highSpeedSession != null) {
             val highSpeedRequests = try {
-                highSpeedSession.createHighSpeedRequestList(builder.build())
+                highSpeedSession.createHighSpeedRequestList(activeBuilder.build())
             } catch (exception: Exception) {
                 handleHighSpeedRepeatingFailure(
                     "high-speed-request-list-failed",
@@ -675,7 +706,7 @@ class CameraStreamer(
         }
 
         return runCatching {
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(activeBuilder.build(), null, backgroundHandler)
             updateStreamDebugState(
                 sessionMode = currentSessionMode,
                 sessionModeReason = currentSessionModeReason,
@@ -686,6 +717,10 @@ class CameraStreamer(
         }.onFailure {
             onStatus("Failed to update request: ${it.javaClass.simpleName}")
         }.isSuccess
+    }
+
+    private fun cameraDeviceForRequest(explicit: CameraDevice?): CameraDevice? {
+        return explicit ?: cameraDevice
     }
 
     private fun handleHighSpeedRepeatingFailure(
@@ -893,7 +928,7 @@ class CameraStreamer(
             targetFps = config?.targetFps,
             targetFpsRange = config?.let { effectiveTargetFpsRange(it, highSpeedActive) }?.let(::rangeLabel),
             h264Enabled = config?.h264Enabled == true,
-            mjpegPipeline = config?.mjpegPipeline?.controlValue,
+            mjpegPipeline = activeMjpegPipeline.controlValue,
             highSpeedRequested = config?.highSpeedVideoEnabled == true,
             highSpeedActive = highSpeedActive,
             sessionMode = sessionMode,
@@ -992,20 +1027,54 @@ class CameraStreamer(
         val overlayRenderDurationMs: Long
     )
 
-    private fun cameraJpegImageToBytes(image: Image): JpegEncodeResult {
-        val buffer = image.planes.firstOrNull()?.buffer?.duplicate()
-        if (buffer == null) {
-            return JpegEncodeResult(
-                bytes = ByteArray(0),
-                rotationAppliedBeforeEncodeDegrees = 0,
-                yuvToNv21DurationMs = 0,
-                jpegCompressDurationMs = 0,
-                overlayAppliedBeforeEncode = false,
-                overlayRenderDurationMs = 0
+    private sealed class CopiedFrame {
+        abstract val width: Int
+        abstract val height: Int
+
+        data class Yuv(
+            val nv21: ByteArray,
+            override val width: Int,
+            override val height: Int,
+            val yuvToNv21DurationMs: Long
+        ) : CopiedFrame()
+
+        data class CameraJpeg(
+            val bytes: ByteArray,
+            override val width: Int,
+            override val height: Int
+        ) : CopiedFrame()
+    }
+
+    private fun copyCapturedFrame(image: Image, pipeline: MjpegPipeline): CopiedFrame {
+        return when (pipeline) {
+            MjpegPipeline.YUV_JPEG -> {
+                val convertStartedAtMs = SystemClock.elapsedRealtime()
+                val nv21 = yuv420888ToNv21(image)
+                CopiedFrame.Yuv(
+                    nv21 = nv21,
+                    width = image.width,
+                    height = image.height,
+                    yuvToNv21DurationMs = SystemClock.elapsedRealtime() - convertStartedAtMs
+                )
+            }
+
+            MjpegPipeline.CAMERA_JPEG -> CopiedFrame.CameraJpeg(
+                bytes = copyCameraJpegBytes(image),
+                width = image.width,
+                height = image.height
             )
         }
+    }
+
+    private fun copyCameraJpegBytes(image: Image): ByteArray {
+        val buffer = image.planes.firstOrNull()?.buffer?.duplicate()
+        if (buffer == null) return ByteArray(0)
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
+        return bytes
+    }
+
+    private fun cameraJpegBytesToResult(bytes: ByteArray): JpegEncodeResult {
         return JpegEncodeResult(
             bytes = bytes,
             rotationAppliedBeforeEncodeDegrees = 0,
@@ -1016,22 +1085,22 @@ class CameraStreamer(
         )
     }
 
-    private fun yuv420ToJpeg(
-        image: Image,
+    private fun yuv420ToJpegFromNv21(
+        nv21: ByteArray,
+        width: Int,
+        height: Int,
+        yuvToNv21DurationMs: Long,
         jpegQuality: Int,
         outputRotationDegrees: Int,
         overlayStatus: VideoOverlayStatus
     ): JpegEncodeResult {
-        val convertStartedAtMs = SystemClock.elapsedRealtime()
-        val nv21 = yuv420888ToNv21(image)
         val normalizedOutputRotation = normalizeOutputRotationDegrees(outputRotationDegrees)
         val rotationAppliedBeforeEncode = if (normalizedOutputRotation == 180) {
-            rotateNv21By180InPlace(nv21, image.width, image.height)
+            rotateNv21By180InPlace(nv21, width, height)
             180
         } else {
             0
         }
-        val convertFinishedAtMs = SystemClock.elapsedRealtime()
         var overlayAppliedBeforeEncode = false
         var overlayRenderDurationMs = 0L
         if (overlayStatus.enabled && (normalizedOutputRotation == 0 || normalizedOutputRotation == 180)) {
@@ -1042,8 +1111,8 @@ class CameraStreamer(
             runCatching {
                 nv21OverlayRenderer.draw(
                     nv21 = nv21,
-                    width = image.width,
-                    height = image.height,
+                    width = width,
+                    height = height,
                     timestamp = timestamp,
                     status = overlayStatus
                 )
@@ -1052,11 +1121,11 @@ class CameraStreamer(
                 overlayRenderDurationMs = SystemClock.elapsedRealtime() - overlayStartedAtMs
             }
         }
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val compressStartedAtMs = SystemClock.elapsedRealtime()
         val jpeg = ByteArrayOutputStream().use { output ->
             yuvImage.compressToJpeg(
-                Rect(0, 0, image.width, image.height),
+                Rect(0, 0, width, height),
                 jpegQuality.coerceIn(25, 92),
                 output
             )
@@ -1065,7 +1134,7 @@ class CameraStreamer(
         return JpegEncodeResult(
             bytes = jpeg,
             rotationAppliedBeforeEncodeDegrees = rotationAppliedBeforeEncode,
-            yuvToNv21DurationMs = convertFinishedAtMs - convertStartedAtMs,
+            yuvToNv21DurationMs = yuvToNv21DurationMs,
             jpegCompressDurationMs = SystemClock.elapsedRealtime() - compressStartedAtMs,
             overlayAppliedBeforeEncode = overlayAppliedBeforeEncode,
             overlayRenderDurationMs = overlayRenderDurationMs

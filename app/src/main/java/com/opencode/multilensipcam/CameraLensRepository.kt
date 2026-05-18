@@ -220,7 +220,9 @@ class CameraLensRepository(private val cameraManager: CameraManager) {
         val zoomRatioRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
         } else {
-            null
+            characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+                ?.takeIf { it > 1f }
+                ?.let { maxZoom -> Range(1f, maxZoom) }
         }
 
         val fpsRanges = characteristics

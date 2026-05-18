@@ -102,6 +102,12 @@ class MainActivity : AppCompatActivity() {
     private var previousScreenBrightness: Float? = null
     private val h264IdleHandler = Handler(Looper.getMainLooper())
     private val h264IdleStopRunnable = Runnable { stopH264IfStillIdle() }
+    private val mjpegDemandSyncHandler = Handler(Looper.getMainLooper())
+    private val mjpegDemandSyncRunnable = Runnable {
+        if (::streamer.isInitialized) {
+            streamer.onMjpegDemandStateChanged()
+        }
+    }
     private val cameraDeviceProfile = CameraDeviceProfileLibrary.profileForCurrentDevice()
     private val cameraScanInProgress: Boolean
         get() = ::cameraScanCoordinator.isInitialized && cameraScanCoordinator.inProgress
@@ -337,6 +343,7 @@ class MainActivity : AppCompatActivity() {
             updateKeepScreenOn(false)
         }
         h264IdleHandler.removeCallbacks(h264IdleStopRunnable)
+        mjpegDemandSyncHandler.removeCallbacks(mjpegDemandSyncRunnable)
         runCatching { unregisterReceiver(batteryStatusReceiver) }
         super.onDestroy()
     }
@@ -883,7 +890,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onMjpegClientCountChanged() {
-        // CameraStreamer checks the recent-client window before doing JPEG work.
+        if (::streamer.isInitialized) {
+            streamer.onMjpegDemandStateChanged()
+        }
+        mjpegDemandSyncHandler.removeCallbacks(mjpegDemandSyncRunnable)
+        mjpegDemandSyncHandler.postDelayed(
+            mjpegDemandSyncRunnable,
+            MJPEG_IDLE_GRACE_RESYNC_DELAY_MS
+        )
     }
 
     private fun onH264ClientCountChanged() {
@@ -2149,6 +2163,7 @@ class MainActivity : AppCompatActivity() {
         const val AUDIO_READY_WAIT_TIMEOUT_MS = 3_000L
         const val AUDIO_READY_WAIT_INTERVAL_MS = 100L
         const val MJPEG_IDLE_GRACE_MS = 5_000L
+        const val MJPEG_IDLE_GRACE_RESYNC_DELAY_MS = MJPEG_IDLE_GRACE_MS + 300L
         const val H264_IDLE_STOP_DELAY_MS = 5_000L
     }
 

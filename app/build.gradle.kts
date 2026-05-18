@@ -10,15 +10,31 @@ android {
     namespace = "com.opencode.multilensipcam"
     compileSdk = 34
 
+    val localDebugKeystore = rootProject.file(".android/debug.keystore")
+
     defaultConfig {
         applicationId = "com.opencode.multilensipcam"
         minSdk = 25
         targetSdk = 34
-        versionCode = 95
-        versionName = "0.5.26"
+        versionCode = 99
+        versionName = "0.5.30"
+    }
+
+    signingConfigs {
+        create("localDebug") {
+            storeFile = localDebugKeystore
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
+        debug {
+            if (localDebugKeystore.isFile) {
+                signingConfig = signingConfigs.getByName("localDebug")
+            }
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
