@@ -12,10 +12,10 @@ android {
 
     defaultConfig {
         applicationId = "com.opencode.multilensipcam"
-        minSdk = 28
+        minSdk = 25
         targetSdk = 34
-        versionCode = 94
-        versionName = "0.5.25"
+        versionCode = 95
+        versionName = "0.5.26"
     }
 
     buildTypes {
