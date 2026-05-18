@@ -16,8 +16,8 @@ android {
         applicationId = "com.opencode.multilensipcam"
         minSdk = 25
         targetSdk = 34
-        versionCode = 99
-        versionName = "0.5.30"
+        versionCode = 100
+        versionName = "0.5.31"
     }
 
     signingConfigs {

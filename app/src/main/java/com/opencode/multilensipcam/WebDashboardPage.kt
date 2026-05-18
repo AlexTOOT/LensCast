@@ -8,7 +8,7 @@ object WebDashboardPage {
             <head>
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
-              <title>LensCast</title>
+              <title>全镜直播(LensCast)</title>
               <style>
                 :root {
                   color-scheme: dark;
@@ -514,7 +514,7 @@ object WebDashboardPage {
               <div class="shell">
                 <div class="topbar">
                   <div>
-                    <h1>LensCast</h1>
+                    <h1>全镜直播(LensCast)</h1>
                     <p id="versionText">${versionLabel}</p>
                   </div>
                   <div class="top-actions">
@@ -1979,7 +1979,7 @@ object WebDashboardPage {
             <head>
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
-              <title>LensCast</title>
+              <title>全镜直播(LensCast)</title>
             </head>
             <body>
               <div id="app">Loading…</div>
